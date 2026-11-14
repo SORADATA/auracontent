@@ -191,7 +191,8 @@ Réponds uniquement en JSON : {{"is_duplicate": true/false, "matched_topic": "..
                 print(f"⚠️ Nouvelle tentative avec {candidate_count} scènes pour respecter le budget.")
             try:
                 with self.llm_stage("script"):
-                    return self._generate_script_attempt(topic, candidate_count, chosen_hook, max_retries)
+                    return self._generate_script_attempt(topic, candidate_count, chosen_hook, max_retries,
+                                                         can_reduce=idx < len(candidate_counts) - 1)
             except TopicRejected:
                 raise                     # moins de scènes ne rendrait pas le script plus vrai
             except (RuntimeError, ValueError) as e:
@@ -200,7 +201,7 @@ Réponds uniquement en JSON : {{"is_duplicate": true/false, "matched_topic": "..
 
         raise RuntimeError(f"Impossible de générer un script. Dernière erreur : {last_error}") from last_error
 
-    def _generate_script_attempt(self, topic, scene_count, chosen_hook, max_retries):
+    def _generate_script_attempt(self, topic, scene_count, chosen_hook, max_retries, can_reduce=False):
         """Boucle de correction (validation de structure puis fact-check)."""
         correction_feedback = ""
         for attempt in range(max_retries + 1):
@@ -215,8 +216,9 @@ Réponds uniquement en JSON : {{"is_duplicate": true/false, "matched_topic": "..
 
             scenes = data.get("scenes", [])
             if not self.scene_count_accepted(len(scenes), scene_count):
-                if self.reduce_target_on_count_mismatch:
-                    # hors de la plage acceptée : cible réduite (scene_count_candidates) plutôt que de redemander
+                if self.reduce_target_on_count_mismatch and can_reduce:
+                    # hors de la plage acceptée : cible réduite (scene_count_candidates) plutôt que de redemander ;
+                    # à la dernière cible, correction demandée au même nombre (jamais un seul essai)
                     raise SceneCountError(f"{len(scenes)} scène(s) rendue(s) pour {scene_count} visée(s).")
                 if last:
                     raise SceneCountError(f"Échec du comptage des scènes après {max_retries + 1} tentatives.")

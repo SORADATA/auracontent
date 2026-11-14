@@ -101,12 +101,37 @@ def test_out_of_range_retries_with_reduced_target_then_renumbers(monkeypatch, ca
 
 
 def test_all_targets_out_of_range_is_a_script_failure(monkeypatch):
-    brain = _mystery(_CountLLM(9, 9, 9))
-    brain.build_script_prompt = lambda *a, **k: [{"role": "user", "content": "x"}]
+    brain = _mystery(_CountLLM(9, 9, 9, 9, 9))
+    targets = []
+    brain.build_script_prompt = lambda topic, n, hook, feedback="": targets.append((n, bool(feedback))) or [
+        {"role": "user", "content": "x"}]
     brain.target_scene_count = lambda: 6
     with pytest.raises(RuntimeError) as err:
         brain.generate_script("t")
     assert isinstance(err.value.__cause__, SceneCountError)
+    # 6 et 5 : un essai chacun puis cible réduite ; 4 (dernière cible) : 3 essais, avec correction demandée
+    assert targets == [(6, False), (5, False), (4, False), (4, True), (4, True)]
+
+
+def test_last_target_gets_corrections_not_a_single_try():
+    """Opéra de Lyon : matière courte, cible 4 (déjà le minimum) ; le LLM rend 7 scènes puis corrige."""
+    brain = _mystery(_CountLLM(7, 4))
+    brain.build_script_prompt = lambda *a, **k: [{"role": "user", "content": "x"}]
+    brain._validate_script_base = lambda data: None
+    brain.validate_script_specifics = lambda data, topic: None
+    brain.check_script_logic = lambda topic, data: []
+    brain.target_scene_count = lambda: 4
+    assert len(brain.generate_script("t")["scenes"]) == 4
+
+
+# ---------- 4. Mots d'un titre : ponctuation et milliers ----------
+def test_title_word_count_ignores_punctuation_and_thousands():
+    from auracontent.channels.mystery.brain import title_words
+
+    ecrins = "1864 : La Barre des Écrins, 4\u202f101\u202fm, était\u2011elle déjà hors du top français ?"
+    assert title_words(ecrins) == 13                      # le run comptait 16 (« : », « ? », « 4 101 »)
+    assert MysteryBrain.title_format_issue(ecrins) is None
+    assert title_words(" ".join(["mot"] * 15)) == 15
 
 
 def test_other_channels_keep_correction_at_same_target():

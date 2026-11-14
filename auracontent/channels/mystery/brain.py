@@ -93,6 +93,16 @@ def title_key(text: str) -> str:
     return fold(re.sub(r"\([^)]*\)", " ", text))
 
 
+def title_words(title: str) -> int:
+    """Mots d'un titre après normalisation (NFKC, espaces fines/insécables) : la ponctuation seule (« : »,
+    « ? ») ne compte pas, et un nombre écrit avec séparateur de milliers (« 4 101 ») compte pour un mot."""
+    text = unicodedata.normalize("NFKC", str(title or ""))
+    for char, repl in _SPECIAL_CHARS.items():
+        text = text.replace(char, repl)
+    text = re.sub(r"(?<=\d) (?=\d{3}\b)", "", text)
+    return len([w for w in text.split() if re.search(r"\w", w)])
+
+
 class TitleSet(set):
     """Ensemble de titres comparés par title_key : « Boussac (Creuse) » et « boussac » sont le même titre."""
 
@@ -658,8 +668,9 @@ class MysteryBrain(BaseBrain):
             return "titre vide"
         if len(title) > MAX_TITLE_CHARS:
             return f"{len(title)} caractères, maximum {MAX_TITLE_CHARS}"
-        if len(title.split()) > 14:
-            return f"{len(title.split())} mots, maximum 14"
+        words = title_words(title)
+        if words > 14:
+            return f"{words} mots, maximum 14"
         banned = [w.strip() for w in BANNED_TITLE_WORDS if w in title.lower()]
         if banned:
             return f"mot interdit « {banned[0]} »"
