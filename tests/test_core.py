@@ -978,7 +978,7 @@ def test_headline_rejects_a_date_absent_from_the_source():
 def test_veracity_warning_at_the_limit_rejects_the_topic():
     from auracontent.core.brain.base_brain import TopicRejected
 
-    brain = _mystery_brain(_ScriptedLLM(*[{"scenes": [{"id": 1, "text": "x"}]}] * 3))
+    brain = _mystery_brain(_ScriptedLLM(*[{"scenes": [{"id": i, "text": "x"} for i in range(1, 6)]}] * 3))
     brain.target_scene_count = lambda: 5
     brain._validate_script_base = lambda data: None
     brain.validate_script_specifics = lambda data, topic: None
@@ -990,7 +990,7 @@ def test_veracity_warning_at_the_limit_rejects_the_topic():
         brain.generate_script("t")
     assert len(calls) == 3                         # pas de nouvel essai avec moins de scènes : sujet abandonné
 
-    style_only = _mystery_brain(_ScriptedLLM(*[{"scenes": [{"id": 1, "text": "x"}]}] * 3))
+    style_only = _mystery_brain(_ScriptedLLM(*[{"scenes": [{"id": i, "text": "x"} for i in range(1, 6)]}] * 3))
     style_only.target_scene_count = lambda: 5
     style_only.validate_script_specifics = lambda data, topic: None
     style_only.config["brain"]["scene_count_tolerance"] = 10
@@ -1099,15 +1099,15 @@ def test_script_prompt_carries_anecdote_cited_articles_and_facts():
 
 
 def test_reveal_sentence_is_located_in_its_scene():
-    from auracontent.channels.mystery.brain import MysteryBrain
-
-    data = {"reveal_sentence": "Le saint a le visage de Vercingétorix.",
+    """Choisie par le code (plus proche de la réponse), jamais par le LLM ; jamais d'échec du script."""
+    brain = _mystery_brain()
+    brain._source = {"answer": "Le visage du saint est celui de Vercingétorix."}
+    data = {"reveal_sentence": "Phrase inventée par le LLM.",
             "scenes": [{"text": "Une statue. Un saint."}, {"text": "Mais regardez bien. Le saint a le visage de "
                                                                     "Vercingétorix."}]}
-    MysteryBrain.locate_reveal(data)
+    brain.locate_reveal(data)
     assert data["scenes"][1]["reveal_sentence"] == "Le saint a le visage de Vercingétorix."
-    with pytest.raises(ValueError):
-        MysteryBrain.locate_reveal({"reveal_sentence": "Phrase absente.", "scenes": data["scenes"]})
+    assert "reveal_sentence" not in data["scenes"][0]
 
 
 def test_style_flags_long_sentences_and_decorative_adjectives():

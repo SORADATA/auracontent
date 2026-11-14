@@ -32,7 +32,9 @@ def test_scene_count_failure_raises_scene_count_error(monkeypatch):
     assert isinstance(err.value.__cause__, SceneCountError)
 
 
-def test_mystery_abandons_topic_on_scene_count(monkeypatch):
+def test_scene_count_failure_is_a_normal_script_failure(monkeypatch):
+    """Plus d'abandon immédiat sur le comptage (cible réduite d'abord) : l'échec compte pour l'abandon du sujet
+    en attente, comme tout autre échec de validation."""
     brain = _mystery()
 
     def fail(self, topic, **k):
@@ -40,8 +42,10 @@ def test_mystery_abandons_topic_on_scene_count(monkeypatch):
 
     monkeypatch.setattr(BaseBrain, "generate_script_with_target", fail)
     monkeypatch.setattr(MysteryBrain, "target_scene_count", lambda self: 5)
-    with pytest.raises(TopicRejected, match="nombre de scènes"):
+    with pytest.raises(RuntimeError) as err:
         brain.generate_script("Opéra de Lyon")
+    assert not isinstance(err.value, TopicRejected)
+    assert brain._report["rejet : script"] == 1
 
 
 @pytest.mark.parametrize("error", [RuntimeError("quota"), TopicRejected("fait absent de la source")])
@@ -194,7 +198,7 @@ def test_every_title_rejection_line_carries_a_reason():
     source = inspect.getsource(MysteryBrain)
     lines = [ln for ln in source.splitlines() if "Titre" in ln and "rejeté" in ln and "print(" in ln]
     assert len(lines) >= 4
-    assert all(re.search(r"\(\{|ne nomme pas|\(\{reason", ln) for ln in lines), lines
+    assert all(re.search(r"\(\{|ne nomme|\(\{reason", ln) for ln in lines), lines
 
 
 # ---------- 3. Repli : le sujet le mieux illustré, sans repasser le contrôle du retournement ----------

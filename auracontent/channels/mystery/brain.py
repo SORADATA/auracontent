@@ -3,14 +3,16 @@
 Flux : région + catégorie + format imposés par le code -> page Wikipédia réelle
 -> titre écrit à partir de la page -> hooks -> script ancré sur la page -> fact-check.
 """
+import difflib
 import math
 import random
 import re
 import unicodedata
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from auracontent.core.brain.base_brain import BaseBrain, SceneCountError, TopicRejected, VeracityIssue
+from auracontent.core.brain.base_brain import BaseBrain, SceneCountError, VeracityIssue
 from auracontent.services.scraping.anecdotes import collect_french_anecdotes
 from auracontent.services.scraping.wikipedia import fetch_intro, fetch_page, find_candidates, place_details
 from auracontent.services.visuals.asset_manager import subject_settings
@@ -20,6 +22,7 @@ from auracontent.services.visuals.subject_images import (
     focus_image_count,
     mentions_focus,
     name_matches,
+    name_tokens,
     place_terms_of,
 )
 from auracontent.utils.pending_topic import load_rejected
@@ -74,6 +77,58 @@ def fold(text: str) -> str:
     text = unicodedata.normalize("NFD", str(text).lower())
     text = "".join(c for c in text if unicodedata.category(c) != "Mn")
     return " ".join(re.sub(r"[^a-z0-9]+", " ", text).split())
+
+
+_SPECIAL_CHARS = {"\u202f": " ", "\u00a0": " ", "\u2011": "-", "\u2010": "-"}
+REVEAL_MIN_SIMILARITY = 0.3          # en dessous : dernière phrase de la scène « reveal »
+
+
+def title_key(text: str) -> str:
+    """Forme de comparaison des titres (comme finance) : NFKC, espaces fines/insécables et tirets insécables
+    remplacés, contenu entre parenthèses ignoré, sans accents, casse ni ponctuation.
+    « Poissons (Haute-Marne) » -> « poissons »."""
+    text = unicodedata.normalize("NFKC", str(text or ""))
+    for char, repl in _SPECIAL_CHARS.items():
+        text = text.replace(char, repl)
+    return fold(re.sub(r"\([^)]*\)", " ", text))
+
+
+def title_words(title: str) -> int:
+    """Mots d'un titre après normalisation (NFKC, espaces fines/insécables) : la ponctuation seule (« : »,
+    « ? ») ne compte pas, et un nombre écrit avec séparateur de milliers (« 4 101 ») compte pour un mot."""
+    text = unicodedata.normalize("NFKC", str(title or ""))
+    for char, repl in _SPECIAL_CHARS.items():
+        text = text.replace(char, repl)
+    text = re.sub(r"(?<=\d) (?=\d{3}\b)", "", text)
+    return len([w for w in text.split() if re.search(r"\w", w)])
+
+
+class TitleSet(set):
+    """Ensemble de titres comparés par title_key : « Boussac (Creuse) » et « boussac » sont le même titre."""
+
+    def __init__(self, items=()):
+        super().__init__(title_key(t) for t in items)
+
+    def add(self, item) -> None:
+        super().add(title_key(item))
+
+    def __contains__(self, item) -> bool:
+        return super().__contains__(title_key(item))
+
+    def __or__(self, other) -> "TitleSet":
+        return TitleSet([*self, *other])
+
+
+def similarity(a: str, b: str) -> float:
+    """Proximité de deux phrases après normalisation : le meilleur du recouvrement des mots (F1) et du
+    rapport de séquence (difflib)."""
+    fa, fb = fold(a), fold(b)
+    if not fa or not fb:
+        return 0.0
+    wa, wb = {w for w in fa.split() if len(w) > 2}, {w for w in fb.split() if len(w) > 2}
+    common = len(wa & wb)
+    f1 = 2 * common / (len(wa) + len(wb)) if wa and wb else 0.0
+    return max(f1, difflib.SequenceMatcher(None, fa, fb).ratio())
 
 
 def sentences(text: str) -> list[str]:
@@ -198,6 +253,7 @@ class MysteryBrain(BaseBrain):
     _source: dict | None = field(default=None, init=False, repr=False)      # page Wikipédia du sujet
     _anecdotes: list | None = field(default=None, init=False, repr=False)   # réserve « Le saviez-vous ? »
     last_pick: dict = field(default_factory=dict, init=False, repr=False)   # région, catégorie, source
+    _report: Counter = field(default_factory=Counter, init=False, repr=False)  # sujets testés, rejets par motif
 
     @property
     def prompts_dir(self) -> Path:
@@ -251,15 +307,16 @@ class MysteryBrain(BaseBrain):
         min_images = int(b.get("min_source_images", DEFAULT_MIN_SOURCE_IMAGES))
         used = load_global_history()
         rejected_titles, self._rejected_ids = load_rejected(self.channel_name)
-        used_sources = load_used_sources() | rejected_titles     # sujets publiés ou abandonnés
+        used_sources = TitleSet(load_used_sources() | rejected_titles)   # sujets publiés ou abandonnés
         stats_text = self._stats_text(previous_stats_list)
         tested: dict[str, dict] = {}          # titre de la page -> essai (pour le repli)
 
         sources = [str(x) for x in b.get("topic_sources") or ["keywords"]]
         for attempt in range(1, max_attempts + 1):
             title_vars, region, category, _ = self.build_title_vars(used, stats_text)
-            source, region, category = self._next_source(sources, region, category, used_sources | set(tested))
+            source, region, category = self._next_source(sources, region, category, used_sources | tested.keys())
             if source is None:
+                self._report["rejet : pas de page exploitable"] += 1
                 print(f"   ↻ Essai {attempt}/{max_attempts} : aucune page Wikipédia exploitable "
                       f"({category['name']} / {region['name']}).")
                 continue
@@ -271,15 +328,18 @@ class MysteryBrain(BaseBrain):
             trial["focus"] = self.subject_focus(source)
             trial["images"], trial["focus_images"] = self.count_source_images(source, trial["details"],
                                                                               trial["focus"])
-            tested[source["title"].lower()] = trial
+            tested[title_key(source["title"])] = trial
+            self._report["sujets testés"] += 1
             print(f"   🖼️ Essai {attempt}/{max_attempts} « {source['title']} » : {trial['images']} image(s) "
                   f"exploitable(s) (minimum {min_images}), dont {trial['focus_images']} de "
                   f"« {' / '.join(trial['focus'])} »")
             if not trial["focus_images"]:
                 print("   ↻ Aucune image de l'objet ou de son édifice : sujet écarté.")
+                self._report["rejet : images"] += 1
                 continue
             if trial["images"] < min_images:
                 print("   ↻ Sujet trop peu illustré, sujet suivant.")
+                self._report["rejet : images"] += 1
                 continue
 
             title = self._accept_title(trial, used)
@@ -291,6 +351,7 @@ class MysteryBrain(BaseBrain):
                   "repli sur le sujet testé le mieux illustré, sans repasser le contrôle du retournement.")
             for trial in sorted((t for t in tested.values() if t["focus_images"]), key=lambda t: -t["images"])[:3]:
                 print(f"   ↪ « {trial['source']['title']} » ({trial['images']} image(s))")
+                self._report["repli"] += 1
                 title = self._accept_title(trial, used, check_reversal=False)
                 if title:
                     return self._retain(trial, title)
@@ -341,9 +402,10 @@ class MysteryBrain(BaseBrain):
         user = self.fill(sections["user"], anecdote=source["anecdote"], target=source.get("title", ""),
                          caption=source.get("anecdote_caption") or "aucune")
         try:
-            data = self.llm.call_json_with_retry(
-                [{"role": "system", "content": sections["system"]}, {"role": "user", "content": user}],
-                temperature=0, max_completion_tokens=200, **self.simple_routing())
+            with self.llm_stage("objet"):
+                data = self.llm.call_json_with_retry(
+                    [{"role": "system", "content": sections["system"]}, {"role": "user", "content": user}],
+                    temperature=0, max_completion_tokens=200, **self.simple_routing())
         except (RuntimeError, ValueError) as e:
             print(f"⚠️ Objet de l'anecdote non déterminé ({e}) : l'article sert de sujet.")
             return default
@@ -358,27 +420,48 @@ class MysteryBrain(BaseBrain):
         `check_reversal=False` (repli) : le contrôle du retournement n'est pas repassé, les autres le sont."""
         title = self._write_title(trial["title_vars"], trial["source"], trial.get("focus"))
         if not title:
+            self._report["rejet : titre"] += 1
             return None
         issues = claim_issues(title, source_text(trial["source"], max_chars=100000), "titre")
         if issues:
             print(f"   ↻ Titre rejeté ({issues[0]}) : « {title} »")
+            self._report["rejet : titre"] += 1
             return None
         focus = trial.get("focus") or []
-        place = place_terms_of(trial.get("details"))
-        if focus and not mentions_focus(title, focus, place):
-            print(f"   ↻ Titre rejeté : « {title} » ne nomme pas « {' / '.join(focus)} ».")
+        if focus and not self.names_subject(title, trial):
+            print(f"   ↻ Titre rejeté : « {title} » ne nomme ni l'article « {trial['source'].get('title', '')} » "
+                  f"ni l'objet « {' / '.join(focus)} ».")
+            self._report["rejet : titre"] += 1
             return None
         ok, reason = self.has_reversal(title, trial["source"]) if check_reversal else (True, "")
         if not ok:
             print(f"   ↻ Titre sans retournement rejeté : « {title} » ({reason or 'motif non fourni par le juge'})")
+            self._report["rejet : retournement"] += 1
             return None
         is_dup, matched = self.is_duplicate_topic_llm(title, used)
         if is_dup:
             print(f"   ↻ Doublon avec « {matched} », nouvel essai.")
+            self._report["rejet : doublon"] += 1
             return None
         if not self.extract_facts(trial, title):
+            self._report["rejet : faits"] += 1
             return None
         return title
+
+    @staticmethod
+    def names_subject(title: str, trial: dict) -> bool:
+        """Le titre nomme-t-il le sujet ? Le nom de l'article (sans parenthèses : « Poissons (Haute-Marne) »
+        -> « Poissons »), OU le nom court de l'objet : un de ses noms propres distinctifs, même si c'est la
+        commune (« Stenay » suffit pour « blason de la ville de Stenay »), OU son nom commun (« statue »)."""
+        words = f" {title_key(title)} "
+        article = title_key(trial.get("source", {}).get("title", ""))
+        if article and f" {article} " in words:
+            return True
+        for name in trial.get("focus") or []:
+            proper, _ = name_tokens(name)
+            if any(t not in WEAK_NAME_WORDS and len(t) >= 4 and f" {t} " in words for t in proper):
+                return True
+        return mentions_focus(title, trial.get("focus") or [], place_terms_of(trial.get("details")))
 
     def extract_facts(self, trial: dict, title: str) -> bool:
         """Faits utilisables sur le sujet précis, tirés de la source (gros modèle : véracité), et réponse à
@@ -390,9 +473,10 @@ class MysteryBrain(BaseBrain):
         user = self.fill(sections["user"], title=title, focus=" / ".join(trial.get("focus") or []) or title,
                          source_block=source_text(trial["source"]))
         try:
-            data = self.llm.call_json_with_retry(
-                [{"role": "system", "content": sections["system"]}, {"role": "user", "content": user}],
-                temperature=0, max_completion_tokens=1200, **self.script_routing())
+            with self.llm_stage("faits"):
+                data = self.llm.call_json_with_retry(
+                    [{"role": "system", "content": sections["system"]}, {"role": "user", "content": user}],
+                    temperature=0, max_completion_tokens=1200, **self.script_routing())
         except (RuntimeError, ValueError) as e:
             print(f"   ↻ Extraction des faits impossible ({e}) : sujet écarté.")
             return False
@@ -441,10 +525,11 @@ class MysteryBrain(BaseBrain):
         user = self.fill(sections["user"], title=title, source_title=source.get("title", ""),
                          source_extract=str(source.get("extract", ""))[:1500])
         try:
-            data = self.llm.call_json_with_retry(
-                [{"role": "system", "content": sections["system"]}, {"role": "user", "content": user}],
-                temperature=0, max_completion_tokens=200, **self.simple_routing(),
-            )
+            with self.llm_stage("retournement"):
+                data = self.llm.call_json_with_retry(
+                    [{"role": "system", "content": sections["system"]}, {"role": "user", "content": user}],
+                    temperature=0, max_completion_tokens=200, **self.simple_routing(),
+                )
         except (RuntimeError, ValueError) as e:
             return False, f"contrôle impossible : {e}"
         return data.get("retournement") is True, str(data.get("raison", "")).strip()
@@ -482,9 +567,10 @@ class MysteryBrain(BaseBrain):
             except Exception as e:      # jamais bloquant : la recherche par mots-clés prend le relais
                 print(f"⚠️ « Le saviez-vous ? » indisponible : {e}")
                 self._anecdotes = []
+        excluded = excluded if isinstance(excluded, TitleSet) else TitleSet(excluded)
         while self._anecdotes:
             anecdote = self._anecdotes.pop(0)
-            if anecdote["target"].lower() in excluded or str(anecdote.get("id")) in getattr(self, "_rejected_ids", ()):
+            if anecdote["target"] in excluded or str(anecdote.get("id")) in getattr(self, "_rejected_ids", ()):
                 continue
             page = fetch_page(anecdote["target"])
             if not page:
@@ -494,7 +580,7 @@ class MysteryBrain(BaseBrain):
             related = []
             for link in (anecdote.get("links") or [])[:int(cfg.get("cited_articles", 3))]:
                 intro = fetch_intro(link, int(cfg.get("cited_article_chars", 1500)))
-                if intro and intro["title"].lower() != page["title"].lower():
+                if intro and title_key(intro["title"]) != title_key(page["title"]):
                     related.append(intro)
             return {**page, "anecdote": anecdote["text"], "anecdote_id": anecdote["id"],
                     "anecdote_file": anecdote.get("file"), "anecdote_caption": anecdote.get("caption") or "",
@@ -546,8 +632,9 @@ class MysteryBrain(BaseBrain):
             'Si aucune ne convient, réponds -1. Réponds uniquement en JSON : {"index": <entier>}'
         )
         try:
-            data = self.llm.call_json_with_retry([{"role": "user", "content": prompt}],
-                                                 temperature=0, max_completion_tokens=100, **self.simple_routing())
+            with self.llm_stage("page"):
+                data = self.llm.call_json_with_retry([{"role": "user", "content": prompt}],
+                                                     temperature=0, max_completion_tokens=100, **self.simple_routing())
             idx = int(data.get("index", -1))
         except (RuntimeError, ValueError, TypeError) as e:
             print(f"⚠️ Choix de la source impossible : {e}")
@@ -562,10 +649,11 @@ class MysteryBrain(BaseBrain):
                             "Le titre raconte CE fait, avec les détails exacts de la source.\n\n" + source_block)
         focus_text = " / ".join(focus or []) or source.get("title", "")
         user = self.fill(sections["user"], source_block=source_block, focus=focus_text, **title_vars)
-        data = self.llm.call_json_with_retry(
-            [{"role": "system", "content": sections["system"]}, {"role": "user", "content": user}],
-            temperature=1.0, max_completion_tokens=200, **self.simple_routing(),
-        )
+        with self.llm_stage("titre"):
+            data = self.llm.call_json_with_retry(
+                [{"role": "system", "content": sections["system"]}, {"role": "user", "content": user}],
+                temperature=1.0, max_completion_tokens=200, **self.simple_routing(),
+            )
         title = str(data.get("title", "")).strip().strip('"«» ')
         reason = self.title_format_issue(title)
         if reason:
@@ -580,8 +668,9 @@ class MysteryBrain(BaseBrain):
             return "titre vide"
         if len(title) > MAX_TITLE_CHARS:
             return f"{len(title)} caractères, maximum {MAX_TITLE_CHARS}"
-        if len(title.split()) > 14:
-            return f"{len(title.split())} mots, maximum 14"
+        words = title_words(title)
+        if words > 14:
+            return f"{words} mots, maximum 14"
         banned = [w.strip() for w in BANNED_TITLE_WORDS if w in title.lower()]
         if banned:
             return f"mot interdit « {banned[0]} »"
@@ -636,9 +725,10 @@ class MysteryBrain(BaseBrain):
         sections = self.read_sections("hook_rating.md")
         listing = "\n".join(f"{i}. {h['text']}" for i, h in enumerate(hooks))
         user = self.fill(sections["user"], topic=topic, hooks_list=listing)
-        data = self.llm.call_json_with_retry(
-            [{"role": "system", "content": sections["system"]}, {"role": "user", "content": user}],
-            temperature=0, max_completion_tokens=800, **self.script_routing())
+        with self.llm_stage("accroches (notation)"):
+            data = self.llm.call_json_with_retry(
+                [{"role": "system", "content": sections["system"]}, {"role": "user", "content": user}],
+                temperature=0, max_completion_tokens=800, **self.script_routing())
         notes = {}
         for note in data.get("notes") or []:
             try:
@@ -661,11 +751,12 @@ class MysteryBrain(BaseBrain):
         user = self.fill(sections["user"], n=n, topic=topic, grounding_block=self._grounding(),
                          stats_block=self._stats_text(previous_stats_list))
         for round_ in range(1, HOOK_ROUNDS + 1):
-            data = self.llm.call_json_with_retry(
-                [{"role": "system", "content": self.fill(sections["system"], n=n)},
-                 {"role": "user", "content": user}],
-                temperature=1.0, max_completion_tokens=1500, **self.simple_routing(),
-            )
+            with self.llm_stage("accroches"):
+                data = self.llm.call_json_with_retry(
+                    [{"role": "system", "content": self.fill(sections["system"], n=n)},
+                     {"role": "user", "content": user}],
+                    temperature=1.0, max_completion_tokens=1500, **self.simple_routing(),
+                )
             hooks = self.rate_hooks(self.valid_hooks(data.get("hooks", []), topic), topic)
             if hooks:
                 return sorted(hooks, key=lambda h: -(self._hook_score(h) or 0))[:n]
@@ -693,14 +784,34 @@ class MysteryBrain(BaseBrain):
         return block
 
     def generate_script(self, topic, chosen_hook=None):
-        """Un sujet sur lequel le LLM ne tient pas le nombre de scènes est abandonné tout de suite (jamais repris
-        à l'exécution suivante, où il échouerait de la même façon) : le pipeline passe au sujet suivant."""
+        """Script ; tout échec compte dans le rapport (et, côté pipeline, pour l'abandon du sujet en attente)."""
         try:
             return super().generate_script(topic, chosen_hook=chosen_hook)
-        except RuntimeError as e:
-            if isinstance(e, TopicRejected) or not isinstance(e.__cause__, SceneCountError):
-                raise
-            raise TopicRejected(f"nombre de scènes non tenu : {e.__cause__}") from e
+        except Exception:
+            self._report["rejet : script"] += 1
+            raise
+
+    # Nombre de scènes : entre brain.min_scenes et cible + 1, accepté et renuméroté ; hors de cette plage, la
+    # cible est réduite (cible, cible - 1, ...) au lieu de redemander le même nombre ou d'abandonner le sujet.
+    reduce_target_on_count_mismatch = True
+
+    def scene_count_accepted(self, count: int, target: int) -> bool:
+        return self.min_scenes() <= count <= target + 1
+
+    def scene_count_candidates(self, target: int) -> list[int]:
+        return list(range(target, self.min_scenes() - 1, -1))[:3] or [max(target, self.min_scenes())]
+
+    def run_report(self) -> list[str]:
+        """Fin de run : sujets testés, retenus via le repli, rejets par motif."""
+        if not self._report:
+            return []
+        rejects = sorted(((k.split(" : ", 1)[1], v) for k, v in self._report.items() if k.startswith("rejet")),
+                         key=lambda kv: -kv[1])
+        line = f"🧾 Sujets mystery : {self._report['sujets testés']} testé(s)"
+        if self._report["repli"]:
+            line += f", {self._report['repli']} passage(s) en repli"
+        line += " ; rejets : " + (", ".join(f"{k} {v}" for k, v in rejects) if rejects else "aucun")
+        return [line]
 
     def min_scenes(self) -> int:
         return int(self.config.get("brain", {}).get("min_scenes", DEFAULT_MIN_SCENES))
@@ -814,8 +925,9 @@ class MysteryBrain(BaseBrain):
                   "passé ou présent, ou infinitif) ? Un nom (« construction », « vente ») n'est pas un verbe. "
                   'Réponds uniquement en JSON : {"verbe": true|false, "mot": "..."}')
         try:
-            data = self.llm.call_json_with_retry([{"role": "user", "content": prompt}],
-                                                 temperature=0, max_completion_tokens=100, **self.simple_routing())
+            with self.llm_stage("bandeau"):
+                data = self.llm.call_json_with_retry([{"role": "user", "content": prompt}],
+                                                     temperature=0, max_completion_tokens=100, **self.simple_routing())
         except (RuntimeError, ValueError) as e:
             print(f"⚠️ Contrôle du bandeau impossible : {e}")
             return False
@@ -845,21 +957,31 @@ class MysteryBrain(BaseBrain):
             if scene.get("role") not in ROLES:
                 scene["role"] = "context"
 
-    @staticmethod
-    def locate_reveal(data) -> None:
-        """Rattache 'reveal_sentence' (la phrase de la révélation) à sa scène : la mascotte « surpris » est
-        montrée pendant cette phrase. Phrase absente ou introuvable : correction demandée au LLM."""
-        reveal = str(data.get("reveal_sentence") or "").strip()
-        target = fold(reveal)
-        if not target:
-            raise ValueError("champ 'reveal_sentence' manquant : recopie mot pour mot la phrase de la révélation.")
-        for scene in data["scenes"]:
-            for sentence in sentences(scene.get("text", "")):
-                if fold(sentence) == target or (len(target) > 15 and target in fold(sentence)):
-                    scene["reveal_sentence"] = sentence
-                    return
-        raise ValueError(f"'reveal_sentence' « {reveal} » ne se trouve dans aucune scène : recopie mot pour mot "
-                         "une phrase du script.")
+    def locate_reveal(self, data) -> None:
+        """Phrase de la révélation (la mascotte « surpris » est montrée pendant cette phrase), choisie par le
+        code et jamais par le LLM : la phrase du script la plus proche de la réponse à la question du sujet
+        (similarité après normalisation) ; sous le seuil, la dernière phrase de la scène « reveal » (à défaut,
+        de l'avant-dernière scène). Ne fait jamais échouer le script."""
+        scenes = [s for s in data.get("scenes", []) if isinstance(s, dict)]
+        for scene in scenes:
+            scene.pop("reveal_sentence", None)
+        if not scenes:
+            return
+        answer = str((self._source or {}).get("answer") or "").strip()
+        best = None
+        if answer:
+            candidates = [(similarity(sentence, answer), i, sentence) for i, scene in enumerate(scenes)
+                          if scene.get("role") not in ("hook", "cta") for sentence in sentences(scene.get("text", ""))]
+            if candidates:
+                score, index, sentence = max(candidates, key=lambda c: (c[0], c[1]))
+                if score >= REVEAL_MIN_SIMILARITY:
+                    best = (index, sentence)
+        if best is None:
+            index = next((i for i, s in enumerate(scenes) if s.get("role") == "reveal"), max(len(scenes) - 2, 0))
+            parts = sentences(scenes[index].get("text", "")) or [str(scenes[index].get("text", ""))]
+            best = (index, parts[-1])
+        scenes[best[0]]["reveal_sentence"] = best[1]
+        data["reveal_sentence"] = best[1]
 
     def check_script_logic(self, topic, data):
         """Lieux, style, scènes 'specific' puis fact-check : le fact-check tourne toujours (véracité)."""
@@ -900,10 +1022,11 @@ class MysteryBrain(BaseBrain):
             user = self.fill(sec["user"], topic=topic, scenes_text=text)
 
         try:
-            res = self.llm.call_json_with_retry(
-                [{"role": "system", "content": sec["system"]}, {"role": "user", "content": user}],
-                temperature=0, max_completion_tokens=500, **self.script_routing(),   # véracité : gros modèles
-            )
+            with self.llm_stage("véracité"):
+                res = self.llm.call_json_with_retry(
+                    [{"role": "system", "content": sec["system"]}, {"role": "user", "content": user}],
+                    temperature=0, max_completion_tokens=500, **self.script_routing(),   # véracité : gros modèles
+                )
         except Exception as e:
             if str(self.config.get("brain", {}).get("factcheck", "")).lower() == "strict":
                 # véracité stricte : un script non vérifié n'est jamais accepté (le sujet reste en attente)

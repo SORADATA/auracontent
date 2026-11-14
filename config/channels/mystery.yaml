@@ -56,8 +56,9 @@ brain:
   # accroches, bandeau, légende) : petits modèles. S'ils échouent tous, repli sur les autres modèles, sauf ceux du script (Gemini et gros modèles).
   simple_models: ["gpt-oss-20b", "llama-3.1-8b", "llama-4-scout", "gpt-4.1-mini", "gpt-4o-mini",
                   "glm-4.5-flash", "qwen-flash"]
-  scene_count_tolerance: 1      # script accepté à une scène près de la cible
-  resume_max_attempts: 3        # reprise du sujet validé après un échec du script, au plus 3 fois
+  scene_count_tolerance: 1      # (non utilisé par mystery) : de min_scenes à cible + 1 scènes, script accepté
+                                # et renuméroté ; hors de cette plage, cible réduite (cible, cible - 1...)
+  resume_max_attempts: 2        # 2 échecs du script (toute validation) : sujet abandonné, plus jamais proposé
   resume_max_days: 7
   min_specific_ratio: 0.66      # au moins 4 scènes 'specific' sur 6 (le vrai lieu à l'image)
 

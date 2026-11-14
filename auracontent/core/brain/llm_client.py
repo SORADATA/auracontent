@@ -15,6 +15,7 @@ import json
 import os
 import re
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -105,6 +106,36 @@ def _strip_reasoning(text):
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
     text = re.sub(r"^.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
     return text.strip()
+
+
+def _json_truncated(text) -> bool:
+    """Le JSON s'arrête avant la fermeture de ses accolades/crochets (réponse coupée) : le « réparer » en les
+    fermant perdrait silencieusement la fin (dernières scènes, clés écrites après les scènes)."""
+    if not text:
+        return False
+    t = _strip_reasoning(_clean_json_response(text))
+    try:
+        json.loads(t)
+        return False
+    except Exception:
+        pass
+    depth, in_str, escape = 0, False, False
+    for ch in t:
+        if in_str:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch in "{[":
+            depth += 1
+        elif ch in "}]":
+            depth -= 1
+    return depth > 0 or in_str
 
 
 def _repair_json_text(text):
@@ -328,10 +359,24 @@ class LLMClient:
     order: list[str] = field(default_factory=lambda: list(PROVIDER_SPECS))
     # Journal d'usage : fournisseur -> {calls, failures, prompt_tokens, completion_tokens}
     usage: dict[str, dict[str, int]] = field(default_factory=dict)
+    # Étape en cours (titre, retournement, script...) et appels par étape, pour le rapport de fin
+    stage: str = "autre"
+    stage_usage: dict[str, dict[str, int]] = field(default_factory=dict)
+
+    @contextmanager
+    def in_stage(self, name: str):
+        previous, self.stage = self.stage, name
+        try:
+            yield
+        finally:
+            self.stage = previous
 
     def _record(self, provider: str, ok: bool, response=None) -> None:
         entry = self.usage.setdefault(provider, {"calls": 0, "failures": 0, "prompt_tokens": 0,
                                                  "completion_tokens": 0})
+        step = self.stage_usage.setdefault(self.stage, {"calls": 0, "failures": 0})
+        step["calls"] += 1
+        step["failures"] += 0 if ok else 1
         entry["calls"] += 1
         if not ok:
             entry["failures"] += 1
@@ -355,6 +400,10 @@ class LLMClient:
         total = sum(u["calls"] for u in self.usage.values())
         failed = sum(u["failures"] for u in self.usage.values())
         lines.append(f"   Total : {total} appel(s), dont {failed} échoué(s).")
+        if set(self.stage_usage) - {"autre"}:
+            lines.append("📊 Appels LLM par étape : " + ", ".join(
+                f"{name} {u['calls']}" + (f" (dont {u['failures']} échoué(s))" if u["failures"] else "")
+                for name, u in sorted(self.stage_usage.items(), key=lambda kv: -kv[1]["calls"])))
         return lines
 
     def budget_line(self, videos: int) -> str:
@@ -554,7 +603,9 @@ class LLMClient:
                           f"{err_str[:200]}{'…' if len(err_str) > 200 else ''}")
 
                     if kind == "json_failed":
-                        salvaged = _repair_json_text(_extract_failed_generation(e, err_str))
+                        failed = _extract_failed_generation(e, err_str)
+                        # JSON coupé : on ne le referme pas (la fin serait perdue), on redemande
+                        salvaged = None if _json_truncated(failed) else _repair_json_text(failed)
                         if salvaged:
                             print("🩹 JSON récupéré et réparé depuis failed_generation.")
                             return salvaged
@@ -617,6 +668,10 @@ class LLMClient:
                 try:
                     data = json.loads(_clean_json_response(content))
                 except json.JSONDecodeError:
+                    if _json_truncated(content) and attempt < max_json_retries - 1:
+                        # refermer un JSON coupé perdrait la fin (des scènes) : nouvel essai, plus de tokens
+                        raise json.JSONDecodeError("JSON tronqué (réponse coupée)", content or "",
+                                                   len(content or "")) from None
                     repaired = _repair_json_text(content)
                     if repaired is None:
                         raise

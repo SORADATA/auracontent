@@ -30,8 +30,7 @@ REGLES STRICTES DE NARRATION ET VISUEL :
 12. Les clés 'role' doivent être choisies parmi : "hook", "tension", "context", "value", "escalation", "reveal", "cta".
 
 FORMAT DE SORTIE ATTENDU :
-Retourne un JSON avec les clés : title, on_screen_title, reveal_sentence, era, visual_identity, audio_profile, closing_cta, scenes.
-'reveal_sentence' : la phrase du script, recopiée MOT POUR MOT, qui contient la révélation (la réponse à la question du sujet).
+Retourne un JSON avec les clés : title, on_screen_title, era, visual_identity, audio_profile, closing_cta, scenes.
 'era' : l'époque du fait raconté, EN ANGLAIS, courte et précise (ex : « late 18th century », « 1790s », « 12th century »). Elle sert à dater les images.
 'on_screen_title' : le bandeau affiché en gros pendant TOUTE la vidéo, et lu sur la miniature. Format obligatoire « CONSTAT | CHUTE » : deux segments séparés par une barre verticale, 2 à 4 mots et 18 caractères au plus par segment. Le premier pose le fait, le second le renverse ou le chiffre. Le bandeau contient un verbe (« VENDUE », « DISPARAÎT ») ou un chiffre, et au moins un chiffre, une date ou un nom propre PRÉSENT DANS LA SOURCE ; une date ou un chiffre n'est permis que s'il figure mot pour mot dans la source ; jamais une simple liste de noms de lieux. Compréhensible sans le son et sans avoir vu la vidéo. Pas de question, pas de ponctuation finale (ex : « MONT-SAINT-MICHEL | 70 ANS DE PRISON », « CARCASSONNE | PROMISE AUX DÉMOLISSEURS », « LA JOCONDE VOLÉE | SOUS UNE BLOUSE »).
 Chaque scene dans le tableau 'scenes' doit contenir : id, text, voice_direction, pause_after_ms, stock_search, image_prompt, location_name, location_country, voice_type, mood, role, scene_type, event_context.

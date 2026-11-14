@@ -1,5 +1,6 @@
 import os
 import re
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -103,12 +104,13 @@ qu'un des sujets déjà publiés ? Un simple thème commun (mystère, disparitio
 ne suffit PAS à en faire un doublon.
 Réponds uniquement en JSON : {{"is_duplicate": true/false, "matched_topic": "..." ou null}}"""
 
-        data = self.llm.call_json_with_retry(
-            [{"role": "user", "content": prompt}],
-            temperature=0.1,
-            max_completion_tokens=300,
-            **self.simple_routing(),
-        )
+        with self.llm_stage("doublon"):
+            data = self.llm.call_json_with_retry(
+                [{"role": "user", "content": prompt}],
+                temperature=0.1,
+                max_completion_tokens=300,
+                **self.simple_routing(),
+            )
         if data.get("is_duplicate"):
             return True, data.get("matched_topic")
         return False, None
@@ -128,8 +130,9 @@ Réponds uniquement en JSON : {{"is_duplicate": true/false, "matched_topic": "..
             {"role": "user", "content": prompt},
         ]
 
-        data = self.llm.call_json_with_retry(messages, temperature=1.1, max_completion_tokens=2000,
-                                             **rate_limit_routing_from(self.config.get("brain")))
+        with self.llm_stage("accroches"):
+            data = self.llm.call_json_with_retry(messages, temperature=1.1, max_completion_tokens=2000,
+                                                 **rate_limit_routing_from(self.config.get("brain")))
         hooks = [h for h in data.get("hooks", []) if isinstance(h, dict) and h.get("text")]
         return hooks[:n] or [{"text": topic, "pattern": "default", "raison": ""}]
 
@@ -180,20 +183,16 @@ Réponds uniquement en JSON : {{"is_duplicate": true/false, "matched_topic": "..
         Gère la boucle de repli sur le nombre de scènes : si le LLM échoue (timeout/tokens),
         on retente avec moins de scènes (ex: 11 -> 8 -> 5).
         """
-        candidate_counts = []
-        sc = scene_count
-        while sc >= 5 and len(candidate_counts) < 3:
-            candidate_counts.append(sc)
-            sc -= 3
-        if not candidate_counts:
-            candidate_counts = [scene_count]
+        candidate_counts = self.scene_count_candidates(scene_count)
 
         last_error = None
         for idx, candidate_count in enumerate(candidate_counts):
             if idx > 0:
                 print(f"⚠️ Nouvelle tentative avec {candidate_count} scènes pour respecter le budget.")
             try:
-                return self._generate_script_attempt(topic, candidate_count, chosen_hook, max_retries)
+                with self.llm_stage("script"):
+                    return self._generate_script_attempt(topic, candidate_count, chosen_hook, max_retries,
+                                                         can_reduce=idx < len(candidate_counts) - 1)
             except TopicRejected:
                 raise                     # moins de scènes ne rendrait pas le script plus vrai
             except (RuntimeError, ValueError) as e:
@@ -202,7 +201,7 @@ Réponds uniquement en JSON : {{"is_duplicate": true/false, "matched_topic": "..
 
         raise RuntimeError(f"Impossible de générer un script. Dernière erreur : {last_error}") from last_error
 
-    def _generate_script_attempt(self, topic, scene_count, chosen_hook, max_retries):
+    def _generate_script_attempt(self, topic, scene_count, chosen_hook, max_retries, can_reduce=False):
         """Boucle de correction (validation de structure puis fact-check)."""
         correction_feedback = ""
         for attempt in range(max_retries + 1):
@@ -216,15 +215,18 @@ Réponds uniquement en JSON : {{"is_duplicate": true/false, "matched_topic": "..
             )
 
             scenes = data.get("scenes", [])
-            tolerance = int(self.config.get("brain", {}).get("scene_count_tolerance", 0))
-            if abs(len(scenes) - scene_count) > tolerance:
+            if not self.scene_count_accepted(len(scenes), scene_count):
+                if self.reduce_target_on_count_mismatch and can_reduce:
+                    # hors de la plage acceptée : cible réduite (scene_count_candidates) plutôt que de redemander ;
+                    # à la dernière cible, correction demandée au même nombre (jamais un seul essai)
+                    raise SceneCountError(f"{len(scenes)} scène(s) rendue(s) pour {scene_count} visée(s).")
                 if last:
                     raise SceneCountError(f"Échec du comptage des scènes après {max_retries + 1} tentatives.")
                 correction_feedback = (f"CORRECTION OBLIGATOIRE : génère EXACTEMENT {scene_count} scènes. "
                                        f"Tu en as fait {len(scenes)}.")
                 continue
             if len(scenes) != scene_count:
-                print(f"ℹ️ {len(scenes)} scènes au lieu de {scene_count} : accepté (tolérance de {tolerance}).")
+                print(f"ℹ️ {len(scenes)} scènes au lieu de {scene_count} : accepté et renuméroté.")
                 for idx, scene in enumerate(scenes, start=1):   # numérotation continue
                     if isinstance(scene, dict):
                         scene["id"] = idx
@@ -268,6 +270,29 @@ Réponds uniquement en JSON : {{"is_duplicate": true/false, "matched_topic": "..
             scene.setdefault("scene_type", "generic")
         if not str(data.get("title", "")).strip():
             data["title"] = "Titre généré"
+
+    # ==========================================
+    # COMPTAGE DES SCÈNES ET ÉTAPES (surchargeables)
+    # ==========================================
+    reduce_target_on_count_mismatch = False   # True : nombre hors plage -> cible réduite, sans correction
+
+    def scene_count_accepted(self, count: int, target: int) -> bool:
+        """Nombre de scènes rendu accepté (puis renuméroté) : brain.scene_count_tolerance autour de la cible."""
+        tolerance = int(self.config.get("brain", {}).get("scene_count_tolerance", 0))
+        return abs(count - target) <= tolerance
+
+    def scene_count_candidates(self, target: int) -> list[int]:
+        """Cibles essayées dans l'ordre si un essai échoue (11 -> 8 -> 5)."""
+        counts, sc = [], target
+        while sc >= 5 and len(counts) < 3:
+            counts.append(sc)
+            sc -= 3
+        return counts or [target]
+
+    def llm_stage(self, name: str):
+        """Étape nommée pour le rapport des appels LLM (sans effet avec un client qui ne la gère pas)."""
+        stage = getattr(self.llm, "in_stage", None)
+        return stage(name) if callable(stage) else nullcontext()
 
     # ==========================================
     # MÉTHODES À SURCHARGER

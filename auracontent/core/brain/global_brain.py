@@ -73,10 +73,20 @@ class GlobalBrain:
                 if round_ == rounds:
                     raise RuntimeError(f"{rounds} sujet(s) abandonné(s) par le contrôle de véracité.") from e
                 print(f"↪️ Sujet suivant ({round_ + 1}/{rounds}).")
-            except Exception:
+            except Exception as e:
                 if resumable:
-                    note_script_attempt(channel_name)
-                    print("💾 Sujet, titre et accroche gardés : la prochaine exécution reprendra ce sujet.")
+                    failures = note_script_attempt(channel_name)
+                    limit = int(b.get("resume_max_attempts", 3))
+                    if failures >= limit:
+                        # N-ième échec du script sur ce sujet : abandonné tout de suite et plus jamais proposé
+                        pick = dict(getattr(brain, "last_pick", {}) or {})
+                        print(f"🗑️ Sujet abandonné après {failures} échec(s) du script : {topic}")
+                        clear_pending(channel_name)
+                        note_rejected(channel_name, pick.get("source_title"), pick.get("anecdote_id"),
+                                      f"{failures} échec(s) du script : {e}")
+                    else:
+                        print(f"💾 Sujet, titre et accroche gardés ({failures}/{limit} échec(s)) : la prochaine "
+                              "exécution reprendra ce sujet.")
                 raise
         pick = dict(getattr(brain, "last_pick", {}) or {})
         script.update({"topic": topic, "channel": channel_name, "hook": chosen_hook,

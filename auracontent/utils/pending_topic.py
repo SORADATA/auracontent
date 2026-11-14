@@ -55,11 +55,14 @@ def save_pending(channel: str, state: dict) -> None:
     _write(data, channel)
 
 
-def note_script_attempt(channel: str) -> None:
+def note_script_attempt(channel: str) -> int:
+    """Compte un échec du script sur le sujet en attente ; renvoie le nombre d'échecs (0 si aucun sujet)."""
     data = _load(channel)
-    if channel in data:
-        data[channel]["script_attempts"] = int(data[channel].get("script_attempts", 0)) + 1
-        _write(data, channel)
+    if channel not in data:
+        return 0
+    data[channel]["script_attempts"] = int(data[channel].get("script_attempts", 0)) + 1
+    _write(data, channel)
+    return data[channel]["script_attempts"]
 
 
 def load_pending(channel: str, max_attempts: int = 3, max_age_days: float = 7) -> dict | None:

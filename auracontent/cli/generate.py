@@ -61,6 +61,11 @@ def main(argv: list[str]) -> int:
             print(f"❌ {name} : {e}")
             results[name] = False
 
+    for name in channels:                               # rapport propre à la chaîne (sujets testés, rejets)
+        report = getattr(getattr(brain.channels.get(name), "brain", None), "run_report", None)
+        if callable(report):
+            for line in report():
+                print(line)
     for line in llm.usage_report():
         print(line)
     if llm.usage:
